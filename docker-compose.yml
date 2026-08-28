@@ -1,0 +1,135 @@
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.9
+    command: etcd --advertise-client-urls http://0.0.0.0:2379 --listen-client-urls http://0.0.0.0:2379
+    ports:
+      - "22379:2379"
+
+  vtctld:
+    image: vitess/lite:latest
+    depends_on:
+      - etcd
+    command: >
+      vtctld
+      --topo-implementation etcd2
+      --topo-global-server-address etcd:2379
+      --topo-global-root /vitess/global
+      --cell zone1
+      --service-map grpc-vtctl,grpc-vtctld
+      --port 15000
+      --grpc-port 15999
+    ports:
+      - "25000:15000"
+      - "25999:15999"
+
+  vtgate:
+    image: vitess/lite:latest
+    restart: on-failure  # vttablet이 재시작되며 재연결될 때 gRPC 클라이언트가 패닉하는 경우가 있음(vitess/lite:latest 스냅샷 빌드의 알려진 불안정성)
+    depends_on:
+      - etcd
+      - vtctld
+    command: >
+      vtgate
+      --topo-implementation etcd2
+      --topo-global-server-address etcd:2379
+      --topo-global-root /vitess/global
+      --cell zone1
+      --cells-to-watch zone1
+      --tablet-types-to-wait PRIMARY,REPLICA
+      --service-map grpc-vtgateservice
+      --mysql-server-port 15306
+      --mysql-auth-server-impl none
+      --port 15001
+    ports:
+      - "25306:15306"  # 여기로 mysql 클라이언트가 접속(라우팅 진입점)
+      - "25001:15001"
+
+  mysql-standalone:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: vitesstest123
+      MYSQL_DATABASE: vt_mysql_ks
+    ports:
+      - "23306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-pvitesstest123"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  sr-standalone:
+    image: starrocks/allin1-ubuntu:latest
+    ports:
+      - "29030:9030"
+      - "28030:8030"
+
+  vttablet-mysql:
+    image: vitess/lite:latest
+    restart: on-failure  # cell/keyspace가 아직 없으면 최초 기동 시 죽는다 — init.sh가 만든 뒤 재시작시킴
+    depends_on:
+      mysql-standalone:
+        condition: service_healthy
+    command: >
+      vttablet
+      --topo-implementation etcd2
+      --topo-global-server-address etcd:2379
+      --topo-global-root /vitess/global
+      --tablet-path zone1-0000000200
+      --init-keyspace mysql_ks
+      --init-shard 0
+      --init-tablet-type REPLICA
+      --unmanaged
+      --port 15101
+      --grpc-port 16101
+      --service-map grpc-queryservice,grpc-tabletmanager,grpc-updatestream
+      --db-host mysql-standalone
+      --db-port 3306
+      --db-app-user root --db-app-password vitesstest123 --db-app-use-ssl=false
+      --db-allprivs-user root --db-allprivs-password vitesstest123 --db-allprivs-use-ssl=false
+      --db-dba-user root --db-dba-password vitesstest123 --db-dba-use-ssl=false
+      --db-repl-user root --db-repl-password vitesstest123 --db-repl-use-ssl=false
+      --db-appdebug-user root --db-appdebug-password vitesstest123 --db-appdebug-use-ssl=false
+      --db-filtered-user root --db-filtered-password vitesstest123 --db-filtered-use-ssl=false
+      --health-check-interval 5s
+    ports:
+      - "25101:15101"
+      - "26101:16101"
+
+  vttablet-sr:
+    image: vitess/lite:latest
+    restart: on-failure  # cell/keyspace, StarRocks 초기화(비밀번호/sql_mode)가 끝나기 전엔 죽는다 — init.sh가 처리
+    depends_on:
+      - sr-standalone
+    command: >
+      vttablet
+      --topo-implementation etcd2
+      --topo-global-server-address etcd:2379
+      --topo-global-root /vitess/global
+      --tablet-path zone1-0000000100
+      --init-keyspace sr_ks
+      --init-shard 0
+      --init-tablet-type REPLICA
+      --unmanaged
+      --port 15100
+      --grpc-port 16100
+      --service-map grpc-queryservice,grpc-tabletmanager,grpc-updatestream
+      --db-host sr-standalone
+      --db-port 9030
+      --db-app-user root --db-app-password vitesstest123 --db-app-use-ssl=false
+      --db-allprivs-user root --db-allprivs-password vitesstest123 --db-allprivs-use-ssl=false
+      --db-dba-user root --db-dba-password vitesstest123 --db-dba-use-ssl=false
+      --db-repl-user root --db-repl-password vitesstest123 --db-repl-use-ssl=false
+      --db-appdebug-user root --db-appdebug-password vitesstest123 --db-appdebug-use-ssl=false
+      --db-filtered-user root --db-filtered-password vitesstest123 --db-filtered-use-ssl=false
+      --health-check-interval 5s
+      --queryserver-config-schema-change-signal=false
+      --queryserver-enable-online-ddl=false
+      --heartbeat-enable=false
+      --queryserver-config-schema-reload-time=24h
+    ports:
+      - "25100:15100"
+      - "26100:16100"
+
+networks:
+  default:
+    name: vitess-starrocks-net
