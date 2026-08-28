@@ -27,7 +27,22 @@ VTGate는 `INSERT INTO ... SELECT ...`를 계획할 때 SELECT 쪽에 `LOCK IN S
 `weight_string(...)`(문자열/숫자를 정렬 비교 가능한 바이트열로 바꾸는 MySQL 전용
 내부 함수)을 주입한다. StarRocks에는 이 함수가 없다.
 
-**우회법**: `ORDER BY` 없이 받아온 뒤 애플리케이션에서 정렬. `UNION ALL` 자체는 정상.
+**우회법 1**: `ORDER BY` 없이 받아온 뒤 애플리케이션에서 정렬. `UNION ALL` 자체는 정상.
+
+**우회법 2 (더 나음)**: 바깥쪽에 `ORDER BY`를 걸지 말고, 각 서브쿼리(괄호)
+안에서 개별적으로 `ORDER BY`/`LIMIT`을 건다:
+
+```sql
+(SELECT ... FROM mysql_ks.orders ORDER BY id LIMIT 10)
+UNION ALL
+(SELECT ... FROM sr_ks.orders_archive ORDER BY id LIMIT 10);
+```
+
+각 정렬이 자기 백엔드로 완전히 push-down되고, 바깥 `UNION ALL`은 단순 concat이라
+VTGate가 크로스 소스 병합 정렬을 할 필요가 없어져서 `weight_string` 에러가 안 난다
+([`03c`](../examples/03c_union_all_per_subquery_sort.sql)). 다만 결과는 "각 블록
+내부만 정렬"된 상태다(두 소스를 뒤섞어 전체를 하나로 정렬한 게 아님) — 진짜 전역
+정렬이 필요하면 우회법 1처럼 애플리케이션에서 최종 병합해야 한다.
 
 ### 3. 사이드카(`_vt`) DB
 

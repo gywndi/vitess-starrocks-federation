@@ -40,7 +40,8 @@ mysql client (25306) → VTGate → ┬─ vttablet-mysql(unmanaged) → mysql-s
 | 같은 세션에서 두 키스페이스 조회 | ✅ | [`01`](examples/01_cross_keyspace_select.sql) |
 | 키스페이스 간 JOIN | ✅ | [`02`](examples/02_cross_keyspace_join.sql) |
 | UNION ALL (hot=MySQL + cold=StarRocks 아카이브) | ✅ | [`03`](examples/03_union_all_archive.sql) |
-| UNION ALL + ORDER BY | ❌ | [`03b`](examples/03b_union_all_order_by_FAILS.sql) |
+| UNION ALL + 바깥쪽 전역 ORDER BY | ❌ | [`03b`](examples/03b_union_all_order_by_FAILS.sql) |
+| UNION ALL + 서브쿼리별 개별 ORDER BY/LIMIT | ✅ | [`03c`](examples/03c_union_all_per_subquery_sort.sql) |
 | `INSERT...SELECT`: MySQL → StarRocks (단일 SQL문) | ✅ | [`04`](examples/04_insert_select_mysql_to_starrocks.sql) |
 | `INSERT...SELECT`: StarRocks → MySQL (단일 SQL문) | ❌ | [`04b`](examples/04b_insert_select_starrocks_to_mysql_FAILS.sql) |
 | StarRocks → MySQL, 2단계(SELECT 후 앱에서 INSERT) | ✅ | [`sync_on_demand.py`](examples/sync_on_demand.py) |
