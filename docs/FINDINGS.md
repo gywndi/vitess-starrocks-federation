@@ -264,6 +264,60 @@ desc limit :vtg1`) 통째로 push-down된다 — vtgate가 병합할 다른 소�
 경우"에만 생긴다 — 흔한 "StarRocks 통계/리스트를 정렬해서 보여주기" 요구는
 sr_ks 단독 쿼리로 짜면 전혀 문제되지 않는다.
 
+### `WHERE col IN (SELECT ... FROM mysql_ks)` 서브쿼리로 StarRocks 조회하기 (네이티브 amd64, 2026-08-29)
+
+JOIN 말고 **서브쿼리로 MySQL 쪽 키를 먼저 뽑아 StarRocks를 필터링**하는 패턴도
+확인했다:
+
+```sql
+SELECT customer_id, event_type, amount, event_id
+FROM sr_ks.events
+WHERE customer_id IN (SELECT id FROM mysql_ks.orders WHERE customer = 'carol')
+ORDER BY event_id DESC
+LIMIT 10;
+```
+
+`VEXPLAIN PLAN`을 보면 vtgate가 이걸 **`UncorrelatedSubquery`(`PulloutIn`
+변형)**로 계획한다 — 서브쿼리(`mysql_ks`)를 먼저 통째로 실행해 결과를 바인드
+변수 리스트(`__sq1`)로 만든 뒤, `sr_ks` 쪽에 `WHERE customer_id IN ::__sq1`로
+한 번에 넘겨 **단일 Route**로 끝낸다(JOIN처럼 outer 행마다 반복 호출하지
+않는다). **단순 필터 + `ORDER BY`는 문제없이 동작한다** — `order by
+events.event_id desc`가 `weight_string` 없이 그 Route 안에 그대로 박힌다.
+
+**단, 여기에 `GROUP BY`(집계)를 추가하면 `ORDER BY`가 없어도 실패한다**:
+
+```sql
+SELECT customer_id, COUNT(*) AS cnt, SUM(amount) AS total
+FROM sr_ks.events
+WHERE customer_id IN (SELECT id FROM mysql_ks.orders WHERE customer IN ('carol','dave'))
+GROUP BY customer_id;
+```
+
+```
+ERROR 1064 (HY000): ... No matching function with signature: weight_string(bigint(20)).
+Sql: "select customer_id, count(*) as cnt, sum(amount) as total, weight_string(customer_id)
+      from `events` where :__sq_has_values and customer_id in ::__sq1
+      group by customer_id order by customer_id asc"
+```
+
+`VEXPLAIN`으로 보면 이유가 드러난다 — **단독 `sr_ks` 쿼리(위 "StarRocks 단독
+소팅" 절)에서는 `GROUP BY`가 있어도 Route 하나로 완전히 push-down**됐지만,
+`UncorrelatedSubquery`(`PulloutIn`) 래퍼 **안**에서는 vtgate가 그 신뢰를
+안 하고 바깥에 별도 **`Aggregate`(`Ordered` 변형) 오퍼레이터를 얹어서
+vtgate 레이어에서 다시 집계**한다 — `Ordered` 집계는 입력이 정렬돼 있어야
+하므로 그룹 키에 `weight_string()`을 주입하고, StarRocks가 이를 거부한다.
+물리적으로는 여전히 route가 하나뿐인데도(다른 키스페이스와 병합할 필요가
+없는데도) 이 최적화를 안 타는 건 **서브쿼리 pullout 플래너의 한계**로 보인다.
+JOIN 방식(위 "실무 패턴: MySQL 1~2건 조회 → StarRocks 통계/리스트" 절의
+케이스 A)은 같은 통계 요구를 문제없이 처리했다는 점과 대비된다.
+
+**실무 함의**: **MySQL 키로 StarRocks를 필터링만 할 때는 `WHERE col IN
+(SELECT ...)` 서브쿼리를 써도 되고(JOIN보다 오히려 계획이 단순), 정렬도
+자유롭다.** 하지만 **통계·집계(`GROUP BY`, `COUNT`/`SUM` 등)가 필요하면
+서브쿼리 방식을 피하고 JOIN(outer=MySQL, inner=StarRocks, outer 행 수가
+적을 때)으로 짜야 한다** — 같은 요구를 서브쿼리로 짜면 `GROUP BY`가 있는
+순간 무조건 깨진다.
+
 ### 안정성: vtgate 고빈도 쿼리 부하 (네이티브 amd64 검증 완료)
 
 개발 중 Apple Silicon Mac(docker-compose)에서 JOIN 벤치마크나 고빈도 쿼리 부하를
