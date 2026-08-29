@@ -9,6 +9,8 @@ RDS/Aurora 같은 관리형 MySQL을 붙이는 기능)으로 StarRocks를 끼워
 **한 줄 결론**: 기본 SQL 프록시(SELECT/INSERT/JOIN/UNION)는 된다. VTGate가 크로스 샤드
 처리를 위해 주입하는 일부 MySQL 전용 구문은 StarRocks가 이해 못해서 특정 패턴에서만
 막힌다. 막히는 이유, 우회법, 배제한 대안은 **[docs/FINDINGS.md](docs/FINDINGS.md)** 참고.
+크로스 키스페이스 JOIN은 **StarRocks를 inner(반복 조회 대상)로 두면 MySQL을 inner로
+둘 때보다 약 4배 느리다** — [실측치](docs/FINDINGS.md#join-방향별-성능-실측).
 
 ## 빠른 시작
 
