@@ -181,7 +181,7 @@ outer 행 수가 적더라도 반복 호출 단가 자체가 높으므로, 크�
 `INSERT...SELECT`로 필요한 조각만 한쪽으로 모아온 뒤 단일 백엔드에서 조인하는
 편이 낫다.
 
-### 실무 패턴: MySQL 1~2건 조회 → StarRocks 통계/리스트 조회 (네이티브 amd64, 2026-08-29)
+## 실무 패턴: MySQL 1~2건 조회 → StarRocks 통계/리스트 조회 (네이티브 amd64, 2026-08-29)
 
 가장 흔할 실사용 패턴 — **MySQL에서 PK로 1~2건만 찾은 뒤, 그 키로 StarRocks에서
 통계(그룹핑)나 리스트를 가져오는 경우** — 도 검증했다. 이 방향은 outer(MySQL)가
@@ -234,8 +234,10 @@ weight_string(bigint(20))`). 즉 **판단 기준은 "정렬 키가 어느 컬럼
 매겨야 한다면 애플리케이션에서 받은 뒤 정렬하거나, StarRocks 쪽에 이미 정렬된
 인덱스/뷰를 두는 식으로 우회해야 한다.
 
-**단, `weight_string` 문제는 크로스 키스페이스(JOIN/UNION)일 때만 생긴다 —
-StarRocks 단독(단일 키스페이스) 쿼리는 정렬이 전혀 문제없다.** 같은 `sr_ks.events`
+## StarRocks 단독(단일 키스페이스) 쿼리는 정렬 제약이 없음
+
+`weight_string` 문제는 크로스 키스페이스(JOIN/UNION)일 때만 생긴다 —
+**StarRocks 단독(단일 키스페이스) 쿼리는 정렬이 전혀 문제없다.** 같은 `sr_ks.events`
 테이블에 대해 JOIN 없이 `sr_ks`만 조회하면:
 
 ```sql
@@ -264,7 +266,7 @@ desc limit :vtg1`) 통째로 push-down된다 — vtgate가 병합할 다른 소�
 경우"에만 생긴다 — 흔한 "StarRocks 통계/리스트를 정렬해서 보여주기" 요구는
 sr_ks 단독 쿼리로 짜면 전혀 문제되지 않는다.
 
-### `WHERE col IN (SELECT ... FROM mysql_ks)` 서브쿼리로 StarRocks 조회하기 (네이티브 amd64, 2026-08-29)
+## `WHERE col IN (SELECT ... FROM mysql_ks)` 서브쿼리로 StarRocks 조회하기 (네이티브 amd64, 2026-08-29)
 
 JOIN 말고 **서브쿼리로 MySQL 쪽 키를 먼저 뽑아 StarRocks를 필터링**하는 패턴도
 확인했다:
@@ -318,7 +320,7 @@ JOIN 방식(위 "실무 패턴: MySQL 1~2건 조회 → StarRocks 통계/리스�
 적을 때)으로 짜야 한다** — 같은 요구를 서브쿼리로 짜면 `GROUP BY`가 있는
 순간 무조건 깨진다.
 
-### 안정성: vtgate 고빈도 쿼리 부하 (네이티브 amd64 검증 완료)
+## 안정성: vtgate 고빈도 쿼리 부하 (네이티브 amd64 검증 완료)
 
 개발 중 Apple Silicon Mac(docker-compose)에서 JOIN 벤치마크나 고빈도 쿼리 부하를
 주면 vtgate가 간헐적으로 fatal error(타입 어서션 패닉, 고루틴 캐시 손상, fault
