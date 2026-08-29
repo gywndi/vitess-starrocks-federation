@@ -91,6 +91,44 @@ tablet에서는 공식적으로 허용되는 상황**이다. 다만 사이드카
 - **Vitess VReplication(MoveTables 등)으로 자동 동기화**: 사이드카 DB 문제로 애초에
   StarRocks 쪽에서 vreplication 엔진 자체가 기동 못 함.
 
+## 크로스 키스페이스 JOIN의 실행 순서 — Nested Loop, 그리고 드라이빙 테이블은 FROM 절 순서로 결정
+
+`VEXPLAIN PLAN`으로 실제 실행 계획을 까보면(일반 `EXPLAIN`은 `VT03031: EXPLAIN is
+only supported for single keyspace`로 크로스 키스페이스 쿼리를 지원하지 않는다):
+
+```sql
+VEXPLAIN PLAN
+SELECT o.id, o.customer, o.amount, s.name AS sr_name
+FROM mysql_ks.orders o
+JOIN sr_ks.vitess_test_tbl s ON o.id = s.id;
+```
+
+```json
+{
+  "OperatorType": "Join", "Variant": "Join",
+  "JoinVars": { "o_id": 0 },
+  "Inputs": [
+    { "Keyspace": "mysql_ks", "Query": "select o.id, o.customer, o.amount from orders as o" },
+    { "Keyspace": "sr_ks", "Query": "select s.`name` as sr_name from vitess_test_tbl as s where s.id = :o_id" }
+  ]
+}
+```
+
+- **항상 Nested Loop Join이다.** `Inputs[0]`(outer)을 필터 없이 통째로 조회한 뒤,
+  그 결과의 **각 행마다** 바인드 변수(`:o_id`)를 넣어 `Inputs[1]`(inner)을 반복 쿼리한다.
+  outer가 N행이면 inner에 N번 쿼리가 나간다.
+- **드라이빙(outer) 테이블은 비용 기반이 아니라 SQL `FROM` 절에 먼저 쓴 테이블로 정해진다.**
+  실제로 `FROM sr_ks.vitess_test_tbl s JOIN mysql_ks.orders o`로 순서만 바꿔서 다시
+  `VEXPLAIN`을 돌려보면 outer/inner가 그대로 뒤집힌다 — StarRocks가 outer, MySQL이
+  inner(`WHERE o.id = :s_id`)가 된다. VTGate는 두 백엔드의 행 수·인덱스 같은 실제
+  통계를 갖고 있지 않아서 진짜 옵티마이저처럼 어느 쪽이 더 작은지 판단하지 못하고,
+  그냥 쿼리 텍스트 순서를 따른다.
+
+**실무 함의**: 조인 시 **행 수가 적은 쪽을 `FROM` 절 맨 앞(outer)에 직접 배치**해야
+한다. 신경 안 쓰면 대용량 분석 테이블(StarRocks)이 outer가 돼서 상대 백엔드에 수백만
+번 쿼리를 반복 날리는 최악의 상황이 나올 수 있다 — Vitess가 알아서 최적화해주지
+않는다.
+
 ## 재현 중 겪은 이슈
 
 - **vttablet/vtgate 기동 레이스 컨디션**: `docker-compose up -d`는 모든 서비스를 거의

@@ -38,7 +38,7 @@ mysql client (25306) → VTGate → ┬─ vttablet-mysql(unmanaged) → mysql-s
 | 기능 | 결과 | 예제 |
 |---|---|---|
 | 같은 세션에서 두 키스페이스 조회 | ✅ | [`01`](examples/01_cross_keyspace_select.sql) |
-| 키스페이스 간 JOIN | ✅ | [`02`](examples/02_cross_keyspace_join.sql) |
+| 키스페이스 간 JOIN(항상 Nested Loop, 드라이빙은 `FROM` 절 순서로 결정됨) | ✅ | [`02`](examples/02_cross_keyspace_join.sql), [원리](docs/FINDINGS.md#크로스-키스페이스-join의-실행-순서--nested-loop-그리고-드라이빙-테이블은-from-절-순서로-결정) |
 | UNION ALL (hot=MySQL + cold=StarRocks 아카이브) | ✅ | [`03`](examples/03_union_all_archive.sql) |
 | UNION ALL + 바깥쪽 전역 ORDER BY | ❌ | [`03b`](examples/03b_union_all_order_by_FAILS.sql) |
 | UNION ALL + 서브쿼리별 개별 ORDER BY/LIMIT | ✅ | [`03c`](examples/03c_union_all_per_subquery_sort.sql) |
