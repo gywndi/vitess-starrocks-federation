@@ -234,6 +234,36 @@ weight_string(bigint(20))`). 즉 **판단 기준은 "정렬 키가 어느 컬럼
 매겨야 한다면 애플리케이션에서 받은 뒤 정렬하거나, StarRocks 쪽에 이미 정렬된
 인덱스/뷰를 두는 식으로 우회해야 한다.
 
+**단, `weight_string` 문제는 크로스 키스페이스(JOIN/UNION)일 때만 생긴다 —
+StarRocks 단독(단일 키스페이스) 쿼리는 정렬이 전혀 문제없다.** 같은 `sr_ks.events`
+테이블에 대해 JOIN 없이 `sr_ks`만 조회하면:
+
+```sql
+SELECT customer_id, event_type, amount, event_id
+FROM sr_ks.events
+WHERE customer_id = 1
+ORDER BY event_id DESC
+LIMIT 10;
+```
+
+`VEXPLAIN PLAN`을 까보면 `Route`가 하나뿐이고(`Variant: Unsharded`) `ORDER BY`가
+`weight_string` 없이 그대로 StarRocks 쿼리 텍스트에 박혀서(`... order by event_id
+desc limit :vtg1`) 통째로 push-down된다 — vtgate가 병합할 다른 소스가 없으니
+비교 함수를 주입할 이유 자체가 없기 때문이다. 다음 조합 전부 정상 동작을 확인했다:
+
+- 정수 컬럼(`event_id`) DESC 정렬
+- DECIMAL 컬럼(`amount`) 정렬
+- VARCHAR 컬럼(`event_type`) + 보조키 다중 정렬
+- `WHERE` 없이 전체 스캔 + 다중 컬럼 정렬
+- **`GROUP BY` + `ORDER BY`(집계 컬럼 기준)** — `... group by customer_id,
+  event_type order by total desc`까지 전부 StarRocks로 그대로 내려간다
+
+**실무 함의**: 정렬이 필요한 쿼리는 **StarRocks 하나의 키스페이스로만 끝나도록
+설계하면(MySQL과 JOIN하지 않으면) 아무 제약 없이 자유롭게 정렬**할 수 있다.
+제약은 오직 "정렬 결과가 여러 키스페이스에 걸친 행을 vtgate가 병합해야 하는
+경우"에만 생긴다 — 흔한 "StarRocks 통계/리스트를 정렬해서 보여주기" 요구는
+sr_ks 단독 쿼리로 짜면 전혀 문제되지 않는다.
+
 ### 안정성: vtgate 고빈도 쿼리 부하 (네이티브 amd64 검증 완료)
 
 개발 중 Apple Silicon Mac(docker-compose)에서 JOIN 벤치마크나 고빈도 쿼리 부하를
