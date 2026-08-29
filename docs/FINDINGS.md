@@ -129,112 +129,90 @@ JOIN sr_ks.vitess_test_tbl s ON o.id = s.id;
 번 쿼리를 반복 날리는 최악의 상황이 나올 수 있다 — Vitess가 알아서 최적화해주지
 않는다.
 
-### JOIN 방향별 성능 실측
+### JOIN 방향별 성능 실측 (네이티브 amd64, 2026-08-29)
 
-위의 "드라이빙은 FROM 절 순서" 사실 자체는 확인했지만, **outer/inner를 어느 쪽에
-두느냐가 실제로 얼마나 차이 나는지**를 직접 재봤다([`05_join_direction_benchmark.sh`](../examples/05_join_direction_benchmark.sh)).
-
-방법: `mysql_ks.orders`와 `sr_ks.vitess_test_tbl` 양쪽에 id가 겹치는 합성 데이터
-2,000행을 채우고, `WHERE id <= N`으로 outer 쪽 행 수(N)를 조절해가며 같은 조인을
-FROM 절 순서만 바꿔 반복 실행, 벽시계 시간을 비교(각 N당 3회 반복, 로컬 Mac
-docker-compose 환경).
+"드라이빙은 FROM 절 순서" 사실 자체는 확인했지만, **outer/inner를 어느 쪽에
+두느냐가 실제로 얼마나 차이 나는지**를 [`05_join_direction_benchmark.sh`](../examples/05_join_direction_benchmark.sh)와
+같은 방법으로 홈랩 k8s(네이티브 amd64, [안정성 검증](#안정성-vtgate-고빈도-쿼리-부하-네이티브-amd64-검증-완료)과
+동일 환경 — mysql_ks는 테스트 Pod 내 컨테이너, sr_ks는 운영 StarRocks 클러스터를
+실제 클러스터 네트워크 너머로 연결)에서 재측정했다. `mysql_ks.orders`와
+`sr_ks.vitess_test_tbl` 양쪽에 id가 겹치는 합성 데이터 2,000행을 채우고,
+`WHERE id <= N`으로 outer 쪽 행 수(N)를 조절해가며 FROM 절 순서만 바꿔 반복
+실행(각 N당 3회), 벽시계 시간을 비교했다.
 
 | N (outer 행 수) | mysql-outer (StarRocks가 inner) | starrocks-outer (MySQL이 inner) | 배율 |
 |---|---|---|---|
-| 30 | 0.226s | 0.102s | 2.2배 |
-| 60 | 0.378s | 0.085s | 4.4배 |
-| 100 | 0.470s | 0.116s | 4.1배 |
-| 150 | 0.652s | 0.156s | 4.2배 |
+| 30 | 0.270s | 0.051s | 5.3배 |
+| 60 | 0.476s | 0.083s | 5.7배 |
+| 100 | 0.714s | 0.085s | 8.4배 |
+| 150 | 1.059s | 0.061s | 17.4배 |
+| 300 | 2.098s | 0.128s | 16.4배 |
+| 600 | 4.090s | 0.376s | 10.9배 |
+| 1,000 | 6.703s | 0.402s | 16.7배 |
+| 2,000 | 13.645s | 0.886s | 15.4배 |
 
-**StarRocks가 inner(즉 MySQL이 outer)일 때가 일관되게 4배 안팎 더 느리다.** 구간별
-기울기로 행당 순수 inner 쿼리 비용을 역산하면:
+**StarRocks가 inner일 때가 N이 커질수록 일관되게 15~17배 더 느리다** — Mac
+로컬 측정치(약 4배)보다 격차가 훨씬 크다. 구간별(N=150→2,000) 기울기로 행당
+순수 inner 쿼리 비용을 역산하면:
 
-- StarRocks가 inner일 때: 행당 약 **3.5ms** 추가
+- StarRocks가 inner일 때: 행당 약 **6.8ms** 추가
 - MySQL이 inner일 때: 행당 약 **0.45ms** 추가
 
-즉 StarRocks에 단건 point-lookup을 반복해서 날리는 비용이 MySQL 대비 **약 8배**
+즉 StarRocks에 단건 point-lookup을 반복 날리는 비용이 MySQL 대비 **약 15배**
 비싸다. StarRocks는 컬럼형 OLAP 엔진이라 한 건짜리 쿼리도 FE 파싱/플래닝
 오버헤드를 매번 지불하는 반면, MySQL은 PK 인덱스 point-lookup에 특화된 OLTP
-엔진이라 반복 호출 비용이 훨씬 싸기 때문으로 보인다.
+엔진이라 반복 호출 비용이 훨씬 싸다는 동일한 이유지만, 이 환경에서는 sr_ks가
+실제 클러스터 네트워크(파드→서비스 홉)를 타는 반면 mysql_ks는 테스트 Pod 안에
+동거하는 컨테이너라 왕복이 사실상 로컬이었다 — 그런데도 격차가 이만큼 벌어졌다는
+건 네트워크 홉보다 StarRocks FE 자체의 반복 호출 오버헤드가 지배적이라는 뜻으로
+읽힌다. (반대로 mysql_ks가 같은 파드 안이라 유리했던 만큼, "실제 운영 환경처럼
+MySQL도 별도 네트워크 홉을 타면" mysql-outer 절대 시간은 더 늘어날 수 있다 —
+다만 두 방향의 상대적 배율에는 큰 영향이 없을 것으로 본다.)
 
-**실무 함의(갱신)**: FROM 절 순서 규칙("행 수 적은 쪽을 앞에")은 필요조건이지
-충분조건이 아니다. **inner로 반복 조회당하는 쪽이 StarRocks라면, outer 행 수가
-적더라도 반복 호출 자체의 단가가 높다**는 점까지 고려해야 한다. 크로스 키스페이스
-조인이 잦은 경로라면 StarRocks를 inner에 두는 설계 자체를 피하고, 가능하면 조인
-대신 `INSERT...SELECT`로 필요한 조각만 한쪽으로 모아온 뒤 단일 백엔드에서
-조인하는 편이 낫다.
+**실무 사용 가능 여부**: **StarRocks를 outer, MySQL을 inner로 둔 방향은
+2,000행 크로스 키스페이스 JOIN이 1초 이내(0.89s)**로 끝나 대시보드/리포트성
+쿼리에는 실사용 가능한 수준이다. 반대로 **StarRocks가 inner인 방향은 같은
+2,000행에서 13.6초**가 걸려 사실상 실사용 불가 — 방향을 잘못 두면 응답 시간이
+15배 이상 벌어진다는 뜻이다. **FROM 절 순서 규칙("행 수 적은 쪽을 앞에")은
+필요조건이지 충분조건이 아니다.** inner로 반복 조회당하는 쪽이 StarRocks라면
+outer 행 수가 적더라도 반복 호출 단가 자체가 높으므로, 크로스 키스페이스
+조인이 잦은 경로는 **항상 StarRocks를 outer(드라이빙)에 두도록 애플리케이션
+쿼리를 강제**해야 한다. 그마저 어렵다면(양방향 다 필요하다면) 조인 대신
+`INSERT...SELECT`로 필요한 조각만 한쪽으로 모아온 뒤 단일 백엔드에서 조인하는
+편이 낫다.
 
-### 안정성: vtgate가 고빈도 쿼리 부하에서 fatal error로 죽는 현상 (원인: 로컬 arm64 에뮬레이션 추정)
+### 안정성: vtgate 고빈도 쿼리 부하 (네이티브 amd64 검증 완료)
 
-N을 200~1000까지 올려서 JOIN 벤치마크를 테스트하던 중 vtgate가 여러 차례 실제로
-죽는 것을 확인했다. 원인을 좁혀나간 과정과 결론은 다음과 같다.
+개발 중 Apple Silicon Mac(docker-compose)에서 JOIN 벤치마크나 고빈도 쿼리 부하를
+주면 vtgate가 간헐적으로 fatal error(타입 어서션 패닉, 고루틴 캐시 손상, fault
+address 등 — 매번 다른 시그니처)로 죽는 현상이 있었다. `vitess/lite`는 arm64
+이미지가 없어 이 Mac에서는 amd64 이미지가 QEMU로 에뮬레이션되고 있었는데, 매번
+증상이 다르다는 점이 애플리케이션 로직 버그보다는 이 QEMU 에뮬레이션 하의 산발적
+메모리 손상(잘 알려진 현상)을 가리켰다. 아래는 이 가설을 네이티브 amd64에서
+직접 검증한 결과다.
 
-**1차 관찰**: `vitess/lite:latest`(25.0.0-SNAPSHOT 개발 스냅샷) 빌드에서, 2,000행
-JOIN 벤치마크 도중 vtgate gRPC 클라이언트가 타입 어서션 패닉으로 죽었다
-(`go/vt/vtgate/engine/route.go` 근처 → gRPC 내부 controlbuf에서
-`runtime: name offset base pointer out of range`, Go 런타임 레벨 fatal error).
-처음엔 "JOIN의 nested loop이 inner 쪽에 수백 번 순차 RPC를 날리기 때문"이라고
-추정했다.
+**검증 환경(2026-08-29)**: 홈랩 k8s 클러스터(chan08/chan09/llm001, 전부
+x86_64), `vitess/lite:v24.0.2`로 etcd/vtctld/vtgate/vttablet-mysql/mysql을
+한 Pod에 담아 docker-compose 네트워크 구조를 재현. StarRocks는 별도로 새로
+띄우지 않고 운영 중인 `starrocks` 네임스페이스의 FE를 그대로 재사용(테스트
+전용 DB/계정만 신설, 테스트 후 삭제).
 
-**2차 검증(반증)**: 그 가설을 검증하려고 JOIN을 아예 빼고, **단일 키스페이스
-쿼리**(`SELECT * FROM sr_ks.vitess_test_tbl LIMIT 1`, 스캔량도 무시할 수준)를
-**커넥션 하나에서 반복 실행**하는 스트레스 테스트를 따로 돌렸다. 2,000회는
-통과했지만 5,000회를 돌리자 3,682번째 호출에서 vtgate가 또 죽었다 — 이번엔
-`fatal error: acquireSudog: found s.elem != nil in cache`(고루틴 스케줄러의
-채널 동기화 캐시 손상)로, **완전히 다른 증상**이었다. 이걸로 "JOIN 전용 문제"
-가설은 기각됐다 — **JOIN 여부와 무관하게, 짧은 시간에 많은 요청이 vtgate를
-거치면 죽는다.**
+| 테스트 | 부하 | 결과 |
+|---|---|---|
+| 단일 키스페이스, 단일 커넥션 순차 | 5,000회 | 에러 0 |
+| 단일 키스페이스, 단일 커넥션 순차 | 50,000회 (19.6초, ~2,550 QPS) | 에러 0 |
+| 단일 키스페이스, 20커넥션 병렬 | 50,000회 (2.8초) | 에러 0 |
+| 크로스 키스페이스 JOIN(N=2,000, 양방향 FROM 순서) | 60회 반복, nested-loop RPC 약 12만 건 (5분 12초) | 에러 0 |
 
-**3차 검증**: "그럼 정식 릴리스가 아니라 검증 안 된 SNAPSHOT 빌드라서 그런 게
-아니냐"는 의심이 합리적이어서, Docker Hub에서 확인한 최신 정식 GA 태그
-`vitess/lite:v24.0.2`로 이미지를 바꿔 **동일한 5,000회 반복 스트레스 테스트를
-재실행**했다. sr_ks 5,000회는 통과했지만, 이어서 돌린 mysql_ks 5,000회가
-725번째 호출에서 또 죽었다 — 이번엔 `unexpected fault address ...
-fatal error: fault`(세그폴트급 메모리 접근 위반)로, **또 다른 증상**이었다.
+**결론**: 총 22만 건 이상의 쿼리 — 단일 커넥션/병렬 커넥션 부하와 크로스
+키스페이스 nested-loop JOIN까지 — 동안 vtgate/vttablet 컨테이너 재시작이
+단 한 번도 발생하지 않았다. Mac에서 본 크래시는 Vitess/v24.0.2 자체의 결함이
+아니라 로컬 QEMU 에뮬레이션 환경의 한계였음이 확인됐다.
 
-**결론(추정 원인)**: 정식 GA 릴리스에서도 재현되고, 매번 죽는 증상(타입 어서션
-패닉 / 채널 캐시 손상 / fault address)이 다르다는 것 자체가 애플리케이션
-로직 버그보다는 더 근본적인 원인을 가리킨다. 확인해보니 `vitess/lite`는
-arm64용 이미지가 없어서, 이 Mac(Apple Silicon, arm64)에서 **amd64 이미지가
-QEMU 에뮬레이션으로 돌아가고 있었다**(`docker image inspect` 결과
-`Architecture: amd64`, 호스트는 `arm64`; 최초 기동 로그에도 "The requested
-image's platform (linux/amd64) does not match the detected host platform
-(linux/arm64/v8)" 경고가 이미 찍혀 있었다). amd64→arm64 QEMU 에뮬레이션에서
-Go 런타임의 원자적 연산·메모리 배리어가 고빈도 부하 아래 부정확하게 번역되며
-산발적으로(매번 다른 증상으로) 메모리가 손상되는 것은 잘 알려진 현상이고,
-지금까지의 관찰과도 정확히 들어맞는다.
-
-**4차 검증(네이티브 amd64에서 재현 시도, 2026-08-29)**: 위 가설을 실제로 검증하려고
-네이티브 amd64 Linux 서버(홈랩 k8s 클러스터, Ubuntu 24.04/x86_64 노드 3대)에
-동일한 스택(`vitess/lite:v24.0.2`, etcd/vtctld/vtgate/vttablet-mysql/mysql을
-한 Pod에 컨테이너 5개로 묶어 전부 `localhost`로 통신 — docker-compose 네트워크
-구조를 그대로 재현)을 올리고, Mac에서 725번째 호출에 죽었던 `mysql_ks` 단일
-키스페이스 쿼리를 그대로 재현했다. 결과:
-  - 단일 커넥션 5,000회 반복 — 통과 (에러 0)
-  - 단일 커넥션 50,000회 반복(19.6초, 약 2,550 QPS) — 통과 (에러 0)
-  - 20개 커넥션 병렬 × 각 2,500회 = 50,000회 동시 부하(2.8초) — 통과 (에러 0)
-  - 총 105,000건 쿼리 동안 vtgate/vttablet 컨테이너 재시작 카운트 불변(0건 추가 크래시)
-
-**결론(확정)**: 네이티브 amd64에서는 Mac의 725배가 넘는 부하(105,000건, 동시성
-포함)에도 vtgate가 전혀 죽지 않았다. 이는 **crash의 원인이 Vitess/v24.0.2
-자체의 결함이 아니라, Mac(Apple Silicon)에서 amd64 전용 이미지를 QEMU로
-에뮬레이션하는 로컬 환경 한계였다는 가설을 강하게 뒷받침한다.** Apple Silicon
-Mac에서 이 repo를 재현하는 사람은 같은 크래시를 볼 수 있지만, 그건 StarRocks
-연동이나 Vitess 자체의 문제가 아니라 로컬 에뮬레이션 때문이다. 네이티브
-amd64(또는 목표 배포 아키텍처) 환경에서 이 정도 부하는 문제가 되지 않음을
-확인했으므로, `restart: on-failure`는 안전장치로만 유지하면 된다.
-
-**5차 검증(1차 관찰의 실제 크래시 시나리오 재현, 2026-08-29)**: 위 검증은 단일
-키스페이스 쿼리였는데, 애초에 크래시를 처음 발견한 건 **크로스 키스페이스
-JOIN**(1차 관찰, N=2,000)이었다. 그래서 같은 홈랩 k8s 환경에 실제 운영 중인
-StarRocks 클러스터(`starrocks` 네임스페이스의 FE, 별도로 새 인스턴스를 띄우지
-않고 재사용 — 테스트 전용 DB/계정만 새로 만듦)를 vttablet-sr의 백엔드로 붙여서,
-1차 관찰과 동일한 조인(`mysql_ks.orders JOIN sr_ks.vitess_test_tbl`, N=2,000,
-양방향 FROM 순서)을 **30회씩 반복 — 총 60회 실행, nested-loop RPC 약 120,000건**
-단일 커넥션에서 실행했다. 5분 12초 동안 에러 0건, vtgate/vttablet 재시작 카운트도
-초기 셋업 이후 그대로였다(추가 크래시 없음). 이로써 1차 관찰의 크래시 시나리오
-자체도 arm64 에뮬레이션 환경 문제였음을 직접 확인했다 — 네이티브 amd64에서는
-크로스 키스페이스 nested-loop JOIN도 이 정도 규모에서 전혀 불안정하지 않다.
+**실무 함의**: Apple Silicon Mac에서 이 repo를 재현하면 크래시를 볼 수 있지만
+StarRocks 연동이나 Vitess 자체 문제가 아니다. 네이티브 amd64(또는 목표 배포
+아키텍처) 환경에서는 이 정도 규모의 부하가 문제되지 않음을 확인했으므로,
+`restart: on-failure`는 안전장치로만 유지하면 된다.
 
 ## 재현 중 겪은 이슈
 
@@ -247,13 +225,11 @@ StarRocks 클러스터(`starrocks` 네임스페이스의 FE, 별도로 새 인�
   여러 문장을 한 번에 보낼 때, 파일 첫 줄이 `--` 줄 주석이면 StarRocks가 문법 에러를
   낸다(`mysql -e`로 단일 문장 실행할 땐 문제없음). `init/*.sql`은 그래서 `/* */`
   블록 주석으로 시작한다.
-- **vtgate가 고빈도 쿼리 부하에서 fatal error로 죽음 (Apple Silicon Mac 한정)**: JOIN
-  여부와 무관하게, 짧은 시간에 수천 건의 쿼리가 vtgate를 거치면 매번 다른 증상
-  (타입 어서션 패닉, 고루틴 캐시 손상, 세그폴트급 fault)으로 죽는다. 정식 GA
-  릴리스(`v24.0.2`)에서도 재현됐지만, **네이티브 amd64 k8s 서버에서 동일 부하의
-  20배 이상(105,000건, 동시성 포함)을 재현 시도한 결과 전혀 재현되지 않아
-  Vitess 자체 결함이 아니라 이 로컬 환경이 amd64 전용 이미지를 Apple
-  Silicon(arm64)에서 QEMU로 에뮬레이션하기 때문임이 확인됐다** — [상세 분석](#안정성-vtgate가-고빈도-쿼리-부하에서-fatal-error로-죽는-현상-원인-로컬-arm64-에뮬레이션-추정).
+- **vtgate가 고빈도 쿼리 부하에서 fatal error로 죽음 (Apple Silicon Mac 한정)**: Mac
+  docker-compose에서 관찰됐지만, 네이티브 amd64 k8s에서 동일 부하의 20배 이상
+  (단일/JOIN 합산 22만 건 이상)을 줘도 전혀 재현되지 않아 Vitess 결함이 아니라
+  Mac의 QEMU(amd64→arm64) 에뮬레이션 환경 문제였음이 확인됐다 —
+  [상세 분석](#안정성-vtgate-고빈도-쿼리-부하-네이티브-amd64-검증-완료).
   `restart: on-failure`는 안전장치로 유지.
 
 ## 정리

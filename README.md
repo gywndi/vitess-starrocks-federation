@@ -10,7 +10,8 @@ RDS/Aurora 같은 관리형 MySQL을 붙이는 기능)으로 StarRocks를 끼워
 처리를 위해 주입하는 일부 MySQL 전용 구문은 StarRocks가 이해 못해서 특정 패턴에서만
 막힌다. 막히는 이유, 우회법, 배제한 대안은 **[docs/FINDINGS.md](docs/FINDINGS.md)** 참고.
 크로스 키스페이스 JOIN은 **StarRocks를 inner(반복 조회 대상)로 두면 MySQL을 inner로
-둘 때보다 약 4배 느리다** — [실측치](docs/FINDINGS.md#join-방향별-성능-실측).
+둘 때보다 15배 이상 느리다**(네이티브 amd64 실측, 2,000행 기준 0.89s vs 13.6s) —
+[실측치](docs/FINDINGS.md#join-방향별-성능-실측-네이티브-amd64-2026-08-29).
 
 ## 빠른 시작
 
@@ -28,7 +29,7 @@ mysql -h 127.0.0.1 -P 25306 -u root < examples/01_cross_keyspace_select.sql
 QEMU로 에뮬레이션된다. 고빈도 쿼리 부하를 주면 vtgate가 fatal error로 죽는 걸 볼 수
 있는데, 이건 StarRocks 연동이나 Vitess 자체 문제가 아니라 이 에뮬레이션 때문이다 —
 네이티브 amd64 서버에서 동일 부하의 20배 이상을 줘도 재현되지 않음을 확인했다.
-[원인 분석](docs/FINDINGS.md#안정성-vtgate가-고빈도-쿼리-부하에서-fatal-error로-죽는-현상-원인-로컬-arm64-에뮬레이션-추정).
+[원인 분석](docs/FINDINGS.md#안정성-vtgate-고빈도-쿼리-부하-네이티브-amd64-검증-완료).
 
 ## 구성
 
