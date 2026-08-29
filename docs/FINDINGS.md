@@ -164,16 +164,55 @@ docker-compose 환경).
 대신 `INSERT...SELECT`로 필요한 조각만 한쪽으로 모아온 뒤 단일 백엔드에서
 조인하는 편이 낫다.
 
-**안정성 관련 경고**: N을 200~1000까지 올려서 테스트하다가 `vitess/lite:latest`
-(25.0.0-SNAPSHOT 개발 스냅샷) 빌드의 vtgate/vttablet이 두 차례 실제로
-죽는 것을 확인했다 — 하나는 vtgate gRPC 클라이언트의 타입 어서션 패닉
-(`go/vt/vtgate/engine/route.go` 근처), 다른 하나는 gRPC 내부 controlbuf에서
-`runtime: name offset base pointer out of range`라는 Go 런타임 레벨 fatal
-error였다. 둘 다 `restart: on-failure`로 자동 복구됐지만, **짧은 시간에 수백 건
-이상의 순차 gRPC 호출(nested loop join의 inner 반복)이 몰리면 이 스냅샷 빌드가
-불안정해질 수 있다**는 뜻이다. 로컬 Mac docker-compose의 리소스 제약이 영향을
-줬을 가능성도 있어 프로덕션 결론으로 일반화하기는 어렵지만, 실사용 전에는 반드시
-안정된 정식 릴리스 버전으로 다시 검증할 것을 권한다.
+### 안정성: vtgate가 고빈도 쿼리 부하에서 fatal error로 죽는 현상 (원인: 로컬 arm64 에뮬레이션 추정)
+
+N을 200~1000까지 올려서 JOIN 벤치마크를 테스트하던 중 vtgate가 여러 차례 실제로
+죽는 것을 확인했다. 원인을 좁혀나간 과정과 결론은 다음과 같다.
+
+**1차 관찰**: `vitess/lite:latest`(25.0.0-SNAPSHOT 개발 스냅샷) 빌드에서, 2,000행
+JOIN 벤치마크 도중 vtgate gRPC 클라이언트가 타입 어서션 패닉으로 죽었다
+(`go/vt/vtgate/engine/route.go` 근처 → gRPC 내부 controlbuf에서
+`runtime: name offset base pointer out of range`, Go 런타임 레벨 fatal error).
+처음엔 "JOIN의 nested loop이 inner 쪽에 수백 번 순차 RPC를 날리기 때문"이라고
+추정했다.
+
+**2차 검증(반증)**: 그 가설을 검증하려고 JOIN을 아예 빼고, **단일 키스페이스
+쿼리**(`SELECT * FROM sr_ks.vitess_test_tbl LIMIT 1`, 스캔량도 무시할 수준)를
+**커넥션 하나에서 반복 실행**하는 스트레스 테스트를 따로 돌렸다. 2,000회는
+통과했지만 5,000회를 돌리자 3,682번째 호출에서 vtgate가 또 죽었다 — 이번엔
+`fatal error: acquireSudog: found s.elem != nil in cache`(고루틴 스케줄러의
+채널 동기화 캐시 손상)로, **완전히 다른 증상**이었다. 이걸로 "JOIN 전용 문제"
+가설은 기각됐다 — **JOIN 여부와 무관하게, 짧은 시간에 많은 요청이 vtgate를
+거치면 죽는다.**
+
+**3차 검증**: "그럼 정식 릴리스가 아니라 검증 안 된 SNAPSHOT 빌드라서 그런 게
+아니냐"는 의심이 합리적이어서, Docker Hub에서 확인한 최신 정식 GA 태그
+`vitess/lite:v24.0.2`로 이미지를 바꿔 **동일한 5,000회 반복 스트레스 테스트를
+재실행**했다. sr_ks 5,000회는 통과했지만, 이어서 돌린 mysql_ks 5,000회가
+725번째 호출에서 또 죽었다 — 이번엔 `unexpected fault address ...
+fatal error: fault`(세그폴트급 메모리 접근 위반)로, **또 다른 증상**이었다.
+
+**결론(추정 원인)**: 정식 GA 릴리스에서도 재현되고, 매번 죽는 증상(타입 어서션
+패닉 / 채널 캐시 손상 / fault address)이 다르다는 것 자체가 애플리케이션
+로직 버그보다는 더 근본적인 원인을 가리킨다. 확인해보니 `vitess/lite`는
+arm64용 이미지가 없어서, 이 Mac(Apple Silicon, arm64)에서 **amd64 이미지가
+QEMU 에뮬레이션으로 돌아가고 있었다**(`docker image inspect` 결과
+`Architecture: amd64`, 호스트는 `arm64`; 최초 기동 로그에도 "The requested
+image's platform (linux/amd64) does not match the detected host platform
+(linux/arm64/v8)" 경고가 이미 찍혀 있었다). amd64→arm64 QEMU 에뮬레이션에서
+Go 런타임의 원자적 연산·메모리 배리어가 고빈도 부하 아래 부정확하게 번역되며
+산발적으로(매번 다른 증상으로) 메모리가 손상되는 것은 잘 알려진 현상이고,
+지금까지의 관찰과도 정확히 들어맞는다.
+
+**실무 함의**: 이 크래시들은 Vitess 자체의 결함이라기보다 **"이 로컬 재현
+환경이 amd64 전용 이미지를 arm64에서 에뮬레이션으로 돌린다"는 한계일 가능성이
+가장 높다**. 네이티브 amd64 리눅스(실제 프로덕션 환경 대부분)에서는 이 부하로
+재현 안 될 가능성이 크지만, 이 환경에서 직접 반증할 수는 없어 가설로 남는다.
+Apple Silicon Mac에서 이 repo를 재현하는 사람은 **같은 크래시를 볼 수 있고,
+그건 StarRocks 연동이나 Vitess 자체의 문제가 아니라 로컬 에뮬레이션
+때문일 가능성이 높다는 점을 감안할 것.** 실제 채택 전에는 반드시 네이티브
+amd64(또는 목표 배포 아키텍처) 서버에서 같은 부하로 재검증해야 한다.
+`restart: on-failure`가 걸려 있어 매번 자동 복구는 됐다.
 
 ## 재현 중 겪은 이슈
 
@@ -186,11 +225,12 @@ error였다. 둘 다 `restart: on-failure`로 자동 복구됐지만, **짧은 �
   여러 문장을 한 번에 보낼 때, 파일 첫 줄이 `--` 줄 주석이면 StarRocks가 문법 에러를
   낸다(`mysql -e`로 단일 문장 실행할 땐 문제없음). `init/*.sql`은 그래서 `/* */`
   블록 주석으로 시작한다.
-- **vtgate gRPC 클라이언트 패닉**: vttablet 컨테이너가 재시작되며 재연결될 때, 또는
-  짧은 시간에 수백 건 이상의 순차 gRPC 호출이 몰릴 때(JOIN 성능 실측 중 재현,
-  [상세](#join-방향별-성능-실측)) vtgate가 간헐적으로 패닉하거나 Go 런타임 레벨
-  fatal error로 죽는다(`vitess/lite:latest` 스냅샷 빌드의 알려진 불안정성으로
-  보임). `restart: on-failure`로 자동 복구되도록 해뒀다.
+- **vtgate가 고빈도 쿼리 부하에서 fatal error로 죽음**: JOIN 여부와 무관하게, 짧은
+  시간에 수천 건의 쿼리가 vtgate를 거치면 매번 다른 증상(타입 어서션 패닉, 고루틴
+  캐시 손상, 세그폴트급 fault)으로 죽는다. 정식 GA 릴리스(`v24.0.2`)에서도
+  재현되며, 원인은 이 로컬 환경이 amd64 전용 이미지를 Apple Silicon(arm64)에서
+  QEMU로 에뮬레이션하기 때문일 가능성이 가장 높다 — [상세 분석](#안정성-vtgate가-고빈도-쿼리-부하에서-fatal-error로-죽는-현상-원인-로컬-arm64-에뮬레이션-추정).
+  `restart: on-failure`로 자동 복구되도록 해뒀다.
 
 ## 정리
 

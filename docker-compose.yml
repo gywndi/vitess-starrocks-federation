@@ -6,7 +6,7 @@ services:
       - "22379:2379"
 
   vtctld:
-    image: vitess/lite:latest
+    image: vitess/lite:v24.0.2
     depends_on:
       - etcd
     command: >
@@ -23,8 +23,8 @@ services:
       - "25999:15999"
 
   vtgate:
-    image: vitess/lite:latest
-    restart: on-failure  # vttablet이 재시작되며 재연결될 때 gRPC 클라이언트가 패닉하는 경우가 있음(vitess/lite:latest 스냅샷 빌드의 알려진 불안정성)
+    image: vitess/lite:v24.0.2
+    restart: on-failure  # 고빈도 쿼리 부하 시 vtgate가 fatal error로 죽는 경우가 있음(원인 분석: docs/FINDINGS.md 안정성 절)
     depends_on:
       - etcd
       - vtctld
@@ -64,7 +64,7 @@ services:
       - "28030:8030"
 
   vttablet-mysql:
-    image: vitess/lite:latest
+    image: vitess/lite:v24.0.2
     restart: on-failure  # cell/keyspace가 아직 없으면 최초 기동 시 죽는다 — init.sh가 만든 뒤 재시작시킴
     depends_on:
       mysql-standalone:
@@ -96,7 +96,7 @@ services:
       - "26101:16101"
 
   vttablet-sr:
-    image: vitess/lite:latest
+    image: vitess/lite:v24.0.2
     restart: on-failure  # cell/keyspace, StarRocks 초기화(비밀번호/sql_mode)가 끝나기 전엔 죽는다 — init.sh가 처리
     depends_on:
       - sr-standalone

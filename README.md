@@ -24,6 +24,11 @@ mysql -h 127.0.0.1 -P 25306 -u root < examples/01_cross_keyspace_select.sql
 호스트 쪽 포트만 바꾸면 된다). `init.sh`는 재실행해도 안전하다(idempotent). 정리는
 `docker-compose down`(`-v`를 붙이면 볼륨까지 삭제).
 
+**Apple Silicon Mac 사용자 주의**: `vitess/lite`는 arm64 이미지가 없어서 amd64 이미지가
+QEMU로 에뮬레이션된다. 고빈도 쿼리 부하를 주면 vtgate가 fatal error로 죽는 걸 볼 수
+있는데, 이건 StarRocks 연동 문제가 아니라 이 에뮬레이션 때문일 가능성이 높다 —
+[원인 분석](docs/FINDINGS.md#안정성-vtgate가-고빈도-쿼리-부하에서-fatal-error로-죽는-현상-원인-로컬-arm64-에뮬레이션-추정).
+
 ## 구성
 
 ```
