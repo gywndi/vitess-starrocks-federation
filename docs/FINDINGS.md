@@ -181,6 +181,59 @@ outer 행 수가 적더라도 반복 호출 단가 자체가 높으므로, 크�
 `INSERT...SELECT`로 필요한 조각만 한쪽으로 모아온 뒤 단일 백엔드에서 조인하는
 편이 낫다.
 
+### 실무 패턴: MySQL 1~2건 조회 → StarRocks 통계/리스트 조회 (네이티브 amd64, 2026-08-29)
+
+가장 흔할 실사용 패턴 — **MySQL에서 PK로 1~2건만 찾은 뒤, 그 키로 StarRocks에서
+통계(그룹핑)나 리스트를 가져오는 경우** — 도 검증했다. 이 방향은 outer(MySQL)가
+1~2행이라 StarRocks가 inner라도 위 "JOIN 방향별 성능" 문제(반복 호출 단가)와
+무관하다 — inner 호출 자체가 1~2번만 나가기 때문이다. `mysql_ks.orders`에 2행,
+`sr_ks.events`에 고객당 1,000행(총 2,000행)을 채우고 두 케이스를 테스트했다.
+
+**케이스 A — 그룹핑(통계)**:
+
+```sql
+SELECT o.id, o.customer, COUNT(*) AS event_cnt, SUM(ev.amount) AS total_amount
+FROM mysql_ks.orders o
+JOIN sr_ks.events ev ON o.id = ev.customer_id
+WHERE o.id IN (1,2)
+GROUP BY o.id, o.customer;
+```
+
+문제없이 동작한다. StarRocks 쪽 라우트는 `... where ev.customer_id = :o_id
+group by .0`처럼 고객 1명 단위 집계를 그대로 push-down하고, vtgate가 그 결과를
+다시 합치는 구조라 `weight_string`도 필요 없다. 결과도 정확했다(이벤트 1,000건,
+합계 58743.75 — 직접 계산한 기댓값과 일치). **5회 반복 평균 약 19ms.**
+
+**케이스 B — 리스트 조회**:
+
+```sql
+SELECT o.id, o.customer, ev.event_type, ev.amount
+FROM mysql_ks.orders o
+JOIN sr_ks.events ev ON o.id = ev.customer_id
+WHERE o.id IN (1,2)
+ORDER BY o.id
+LIMIT 50;
+```
+
+이것도 문제없이 동작한다(**5회 반복 평균 약 18ms**). 다만 **`ORDER BY`에
+StarRocks 쪽 컬럼(`ev.event_type`, `ev.amount`, `ev.event_id` 등)이 하나라도
+들어가면 실패한다** — mysql 컬럼과 섞였는지 여부와 무관하다. `ORDER BY
+ev.event_id`처럼 StarRocks 컬럼 단독으로만 정렬해도 똑같은 에러가 난다.
+vtgate가 정렬 키로 쓰이는 컬럼은 **그 컬럼을 낸 쪽 라우트에** `weight_string()`을
+주입해서 비교 가능한 형태로 바꾸는데, 그 라우트가 StarRocks면 함수 자체가
+없어서 거기서 막힌다(`No matching function with signature:
+weight_string(bigint(20))`). 즉 **판단 기준은 "정렬 키가 어느 컬럼과 섞였나"가
+아니라 "정렬 키 중 하나라도 StarRocks 컬럼인가"** 다. 이건 "왜 특정 패턴만
+막히는가 #2"에 정리한 `weight_string` 문제가 **UNION뿐 아니라 크로스
+키스페이스 JOIN의 ORDER BY에도 똑같이 적용된다**는, 기존 문서에 없던 새 사례다.
+
+**실무 함의**: MySQL에서 소수 건을 찾아 그 키로 StarRocks 통계/리스트를
+당겨오는 패턴은 **성능(약 20ms 내외)도 정합성도 문제없다** — 이 구조는 실사용
+가능하다. 단 하나 지켜야 할 규칙: **정렬 키에 StarRocks 컬럼을 절대 넣지
+말 것**(MySQL 쪽 컬럼으로만 정렬하거나 아예 생략). StarRocks 쪽 값으로 순서를
+매겨야 한다면 애플리케이션에서 받은 뒤 정렬하거나, StarRocks 쪽에 이미 정렬된
+인덱스/뷰를 두는 식으로 우회해야 한다.
+
 ### 안정성: vtgate 고빈도 쿼리 부하 (네이티브 amd64 검증 완료)
 
 개발 중 Apple Silicon Mac(docker-compose)에서 JOIN 벤치마크나 고빈도 쿼리 부하를
