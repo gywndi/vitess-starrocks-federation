@@ -129,6 +129,52 @@ JOIN sr_ks.vitess_test_tbl s ON o.id = s.id;
 번 쿼리를 반복 날리는 최악의 상황이 나올 수 있다 — Vitess가 알아서 최적화해주지
 않는다.
 
+### JOIN 방향별 성능 실측
+
+위의 "드라이빙은 FROM 절 순서" 사실 자체는 확인했지만, **outer/inner를 어느 쪽에
+두느냐가 실제로 얼마나 차이 나는지**를 직접 재봤다([`05_join_direction_benchmark.sh`](../examples/05_join_direction_benchmark.sh)).
+
+방법: `mysql_ks.orders`와 `sr_ks.vitess_test_tbl` 양쪽에 id가 겹치는 합성 데이터
+2,000행을 채우고, `WHERE id <= N`으로 outer 쪽 행 수(N)를 조절해가며 같은 조인을
+FROM 절 순서만 바꿔 반복 실행, 벽시계 시간을 비교(각 N당 3회 반복, 로컬 Mac
+docker-compose 환경).
+
+| N (outer 행 수) | mysql-outer (StarRocks가 inner) | starrocks-outer (MySQL이 inner) | 배율 |
+|---|---|---|---|
+| 30 | 0.226s | 0.102s | 2.2배 |
+| 60 | 0.378s | 0.085s | 4.4배 |
+| 100 | 0.470s | 0.116s | 4.1배 |
+| 150 | 0.652s | 0.156s | 4.2배 |
+
+**StarRocks가 inner(즉 MySQL이 outer)일 때가 일관되게 4배 안팎 더 느리다.** 구간별
+기울기로 행당 순수 inner 쿼리 비용을 역산하면:
+
+- StarRocks가 inner일 때: 행당 약 **3.5ms** 추가
+- MySQL이 inner일 때: 행당 약 **0.45ms** 추가
+
+즉 StarRocks에 단건 point-lookup을 반복해서 날리는 비용이 MySQL 대비 **약 8배**
+비싸다. StarRocks는 컬럼형 OLAP 엔진이라 한 건짜리 쿼리도 FE 파싱/플래닝
+오버헤드를 매번 지불하는 반면, MySQL은 PK 인덱스 point-lookup에 특화된 OLTP
+엔진이라 반복 호출 비용이 훨씬 싸기 때문으로 보인다.
+
+**실무 함의(갱신)**: FROM 절 순서 규칙("행 수 적은 쪽을 앞에")은 필요조건이지
+충분조건이 아니다. **inner로 반복 조회당하는 쪽이 StarRocks라면, outer 행 수가
+적더라도 반복 호출 자체의 단가가 높다**는 점까지 고려해야 한다. 크로스 키스페이스
+조인이 잦은 경로라면 StarRocks를 inner에 두는 설계 자체를 피하고, 가능하면 조인
+대신 `INSERT...SELECT`로 필요한 조각만 한쪽으로 모아온 뒤 단일 백엔드에서
+조인하는 편이 낫다.
+
+**안정성 관련 경고**: N을 200~1000까지 올려서 테스트하다가 `vitess/lite:latest`
+(25.0.0-SNAPSHOT 개발 스냅샷) 빌드의 vtgate/vttablet이 두 차례 실제로
+죽는 것을 확인했다 — 하나는 vtgate gRPC 클라이언트의 타입 어서션 패닉
+(`go/vt/vtgate/engine/route.go` 근처), 다른 하나는 gRPC 내부 controlbuf에서
+`runtime: name offset base pointer out of range`라는 Go 런타임 레벨 fatal
+error였다. 둘 다 `restart: on-failure`로 자동 복구됐지만, **짧은 시간에 수백 건
+이상의 순차 gRPC 호출(nested loop join의 inner 반복)이 몰리면 이 스냅샷 빌드가
+불안정해질 수 있다**는 뜻이다. 로컬 Mac docker-compose의 리소스 제약이 영향을
+줬을 가능성도 있어 프로덕션 결론으로 일반화하기는 어렵지만, 실사용 전에는 반드시
+안정된 정식 릴리스 버전으로 다시 검증할 것을 권한다.
+
 ## 재현 중 겪은 이슈
 
 - **vttablet/vtgate 기동 레이스 컨디션**: `docker-compose up -d`는 모든 서비스를 거의
@@ -140,8 +186,10 @@ JOIN sr_ks.vitess_test_tbl s ON o.id = s.id;
   여러 문장을 한 번에 보낼 때, 파일 첫 줄이 `--` 줄 주석이면 StarRocks가 문법 에러를
   낸다(`mysql -e`로 단일 문장 실행할 땐 문제없음). `init/*.sql`은 그래서 `/* */`
   블록 주석으로 시작한다.
-- **vtgate gRPC 클라이언트 패닉**: vttablet 컨테이너가 재시작되며 재연결될 때 vtgate가
-  간헐적으로 패닉하며 죽는다(`vitess/lite:latest` 스냅샷 빌드의 알려진 불안정성으로
+- **vtgate gRPC 클라이언트 패닉**: vttablet 컨테이너가 재시작되며 재연결될 때, 또는
+  짧은 시간에 수백 건 이상의 순차 gRPC 호출이 몰릴 때(JOIN 성능 실측 중 재현,
+  [상세](#join-방향별-성능-실측)) vtgate가 간헐적으로 패닉하거나 Go 런타임 레벨
+  fatal error로 죽는다(`vitess/lite:latest` 스냅샷 빌드의 알려진 불안정성으로
   보임). `restart: on-failure`로 자동 복구되도록 해뒀다.
 
 ## 정리
